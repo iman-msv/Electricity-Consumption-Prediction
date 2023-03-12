@@ -1,0 +1,199 @@
+# Packages
+if (!require(pacman)){
+  install.packages("pacman")
+  library(pacman)
+}
+
+p_load(readr, dplyr, purrr, tidymodels, glmnet, doParallel, naniar)
+
+# Reading the Data Set
+oecd_data <- read_csv("oecd data.csv")
+
+# EDA
+## Consumption Trend
+oecd_data %>% 
+  group_by(year) %>% 
+  summarize(total_consumption = sum(total_consumption)) %>% 
+  ggplot(aes(year, total_consumption)) + geom_point(size = 3, colour = "dodgerblue") +
+  geom_line(linewidth = 1.25, colour = "dodgerblue") + scale_x_continuous(breaks = 1994:2019) +
+  scale_y_continuous(breaks = seq(7500,12000, 500)) + 
+  labs(
+    x = "Year",
+    y = "Consumption (TWh)",
+    title = "Electricity Consumpion vs. Year"
+  ) + 
+  theme(plot.background = element_rect(fill = "#f8f9fa"), 
+        axis.text.x = element_text(angle = 90,
+                                   margin = margin(b = 5, t = 3)),
+        text = element_text(size = 15, family = "Roboto Slab"),
+        plot.title = element_text(colour = "dodgerblue"))
+        
+## Consumption vs. Population
+oecd_data %>% 
+  ggplot(aes(poptotal, total_consumption)) + 
+  geom_point(color = "seagreen") + scale_x_log10() + scale_y_log10() + labs(
+    x = "Population in (Million)",
+    y = "Consumption (TWh)",
+    title = "Electricity Consumpion vs. Population in Logarithmic Scale"
+  ) + 
+  theme(plot.background = element_rect(fill = "#f8f9fa"), 
+        text = element_text(size = 15, family = "Roboto Slab"),
+        plot.title = element_text(colour = "seagreen"))
+        
+## First Lag
+oecd_data %>% 
+  ggplot(aes(consump_lag, total_consumption)) + geom_point(color = "orangered3") + scale_x_log10() + scale_y_log10() + labs(
+    x = "First Lag (TWh)",
+    y = "Consumption (TWh)",
+    title = "Electricity Consumpion vs. First Lag in Logarithmic Scale"
+  ) + 
+  theme(plot.background = element_rect(fill = "#f8f9fa"), 
+        text = element_text(size = 15, family = "Roboto Slab"), 
+        plot.title = element_text(colour = "orangered3"))
+ 
+# Dividing the Data Set Based on GDP per Cap
+oecd_c_qs <- oecd_data %>% 
+  group_by(iso) %>% 
+  mutate(gdp_per_cap_med = median(gdp_per_cap)) %>% 
+  ungroup() %>% 
+  mutate(gdp_per_cap_group = case_when(
+    gdp_per_cap_med <= quantile(gdp_per_cap_med)[2] ~ 1,
+    gdp_per_cap_med > quantile(gdp_per_cap_med)[2] & 
+      gdp_per_cap_med <= quantile(gdp_per_cap_med)[3] ~ 2,
+    gdp_per_cap_med > quantile(gdp_per_cap_med)[3] & gdp_per_cap_med <= quantile(gdp_per_cap_med)[4] ~ 3,
+    gdp_per_cap_med > quantile(gdp_per_cap_med)[4] ~ 4)
+    ) %>% 
+  mutate(gdp_per_cap_group = factor(gdp_per_cap_group, 
+                                    levels = c(1,2,3,4)))
+
+oecd_c_q1 <- oecd_c_qs %>% 
+  filter(gdp_per_cap_group == 1)
+
+oecd_c_q2 <- oecd_c_qs %>% 
+  filter(gdp_per_cap_group == 2)
+
+oecd_c_q3 <- oecd_c_qs %>% 
+  filter(gdp_per_cap_group == 3)
+
+oecd_c_q4 <- oecd_c_qs %>% 
+  filter(gdp_per_cap_group == 4)
+  
+ 
+# Consumption Trends in Different Quarters of GDP per Cap
+oecd_c_qs %>% 
+ggplot(aes(gdp_per_cap_group, total_consumption, group = gdp_per_cap_group)) +
+  geom_boxplot(show.legend = FALSE) + scale_y_log10() + 
+  labs(x = "GDP per Cap Quarter", y = "Consumption", title = "Box Plot") +
+  theme(plot.background = element_rect(fill = "#f8f9fa"),
+        text = element_text(size = 13, family = "Roboto Slab"))
+        
+# Train Test Split
+set.seed(33)
+oecd_splits <- map(list(oecd_c_q1, oecd_c_q2, oecd_c_q3, oecd_c_q4),
+                   initial_split)
+
+oecd_trainings <- map(oecd_splits, training)
+oecd_testing <- map(oecd_splits, testing)
+
+oecd_training_q1 <- oecd_trainings[[1]]
+oecd_training_q2 <- oecd_trainings[[2]]
+oecd_training_q3 <- oecd_trainings[[3]]
+oecd_training_q4 <- oecd_trainings[[4]]
+
+oecd_testing_q1 <- oecd_testing[[1]]
+oecd_testing_q2 <- oecd_testing[[2]]
+oecd_testing_q3 <- oecd_testing[[3]]
+oecd_testing_q4 <- oecd_testing[[4]]
+
+# Recipes
+recipe_func_steps <- function(data, quarter) {
+  if (quarter == 1 | quarter == 2) {
+    formula <- total_consumption ~ poptotal + consump_lag + 
+      hdi + gdp_per_cap + adj_net_nat_income_current
+    recipe <- recipe(formula, data = data) %>% 
+        step_YeoJohnson(all_numeric_predictors()) %>% 
+        step_normalize(all_numeric_predictors())
+  }
+  
+    if (quarter == 3 | quarter == 4) {
+    formula <- total_consumption ~ poptotal + consump_lag + adj_net_nat_income_current
+    recipe <- recipe(formula, data = data) %>% 
+        step_YeoJohnson(all_numeric_predictors()) %>% 
+        step_normalize(all_numeric_predictors())
+  }
+return(recipe)
+}
+
+# GLMNET Model
+glmnet_func <- function(quarter, split) {
+  glmnet_mdl <- linear_reg(
+    mixture = tune(),
+    penalty = tune()
+) %>% 
+  set_engine("glmnet") %>% 
+  set_mode("regression")
+  
+  glmnet_wfl <- workflow() %>% 
+  add_model(glmnet_mdl)
+  
+  if (quarter == 1 | quarter == 2) {
+    glmnet_wfl <- glmnet_wfl %>% 
+      add_formula(total_consumption ~ poptotal + consump_lag +
+                    hdi + gdp_per_cap + adj_net_nat_income_current)
+  }
+  
+  if (quarter == 3 | quarter == 4) {
+    glmnet_wfl <- glmnet_wfl %>% 
+      add_formula(total_consumption ~ poptotal + consump_lag +
+                    adj_net_nat_income_current)
+  }
+  
+  glmnet_params <- extract_parameter_set_dials(glmnet_wfl)
+  
+  glmnet_params_reg <- grid_regular(glmnet_params, levels = 30)
+  
+  set.seed(33)
+  doParallel::registerDoParallel()
+  glmnet_tuning <- glmnet_wfl %>% 
+    tune_grid(
+      resamples = vfold_cv(training(split), v = 4),
+      grid = glmnet_params_reg,
+      metrics = metric_set(rmse)
+      )
+  return(list("glmnet_tuning" = glmnet_tuning,
+              "workflow" = glmnet_wfl))
+}
+
+glmnet_q1_output <- glmnet_func(quarter = 1, oecd_splits[[1]])
+glmnet_q2_output <- glmnet_func(quarter = 2, oecd_splits[[2]])
+glmnet_q3_output <- glmnet_func(quarter = 3, oecd_splits[[3]])
+glmnet_q4_output <- glmnet_func(quarter = 4, oecd_splits[[4]])
+
+## Showing the Tuning Results 
+show_best(glmnet_q1_output$glmnet_tuning, n = 10)
+show_best(glmnet_q2_output$glmnet_tuning, n = 10)
+show_best(glmnet_q3_output$glmnet_tuning, n = 10)
+show_best(glmnet_q4_output$glmnet_tuning, n = 10)
+
+## GLMNET on Test Section for Quarters 1 and 2
+best_glmnet <- glmnet_q1_output$glmnet_tuning %>% 
+  select_best()
+
+glmnet_wfl_tuned_q1 <- glmnet_q1_output$workflow %>% 
+  finalize_workflow(best_glmnet)
+
+best_glmnet <- glmnet_q2_output$glmnet_tuning %>% 
+  select_best()
+
+glmnet_wfl_tuned_q2 <- glmnet_q2_output$workflow %>% 
+  finalize_workflow(best_glmnet)
+
+glmnet_wfl_tuned_q1 %>%
+  last_fit(split = oecd_splits[[1]]) %>% 
+  collect_metrics()
+  
+glmnet_wfl_tuned_q2 %>%
+  last_fit(split = oecd_splits[[2]]) %>% 
+
+# MLP Model
+  collect_metrics()
